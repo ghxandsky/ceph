@@ -3251,6 +3251,8 @@ struct pistate {
 void OSD::build_past_intervals_parallel()
 {
   map<PG*,pistate> pis;
+  set<PG*> fixed;
+  OSDMapRef cur_map, last_map;
 
   // calculate junction of map range
   epoch_t end_epoch = superblock.oldest_map;
@@ -3264,8 +3266,10 @@ void OSD::build_past_intervals_parallel()
 
       epoch_t start, end;
       if (!pg->_calc_past_interval_range(&start, &end, superblock.oldest_map)) {
-        if (pg->info.history.same_interval_since == 0)
+        if (pg->info.history.same_interval_since == 0) {
           pg->info.history.same_interval_since = end;
+          fixed.insert(pg);
+        }
         continue;
       }
 
@@ -3282,14 +3286,17 @@ void OSD::build_past_intervals_parallel()
     }
   }
   if (pis.empty()) {
-    dout(10) << __func__ << " nothing to build" << dendl;
-    return;
+    if (fixed.empty()) {
+      dout(10) << __func__ << " nothing to build or fix" << dendl;
+      return;
+    }
+
+    goto fix;
   }
 
   dout(1) << __func__ << " over " << cur_epoch << "-" << end_epoch << dendl;
   assert(cur_epoch <= end_epoch);
 
-  OSDMapRef cur_map, last_map;
   for ( ; cur_epoch <= end_epoch; cur_epoch++) {
     dout(10) << __func__ << " epoch " << cur_epoch << dendl;
     last_map = cur_map;
@@ -3373,25 +3380,51 @@ void OSD::build_past_intervals_parallel()
   // but we don't check for holes.  we could avoid it by discarding
   // the previous past_intervals and rebuilding from scratch, or we
   // can just do this and commit all our work at the end.
-  ObjectStore::Transaction t;
-  int num = 0;
-  for (map<PG*,pistate>::iterator i = pis.begin(); i != pis.end(); ++i) {
-    PG *pg = i->first;
-    pg->lock();
-    pg->dirty_big_info = true;
-    pg->dirty_info = true;
-    pg->write_if_dirty(t);
-    pg->unlock();
+  {
+    ObjectStore::Transaction t;
+    int num = 0;
+    for (map<PG*,pistate>::iterator i = pis.begin(); i != pis.end(); ++i) {
+      PG *pg = i->first;
+      pg->lock();
+      pg->dirty_big_info = true;
+      pg->dirty_info = true;
+      pg->write_if_dirty(t);
+      pg->unlock();
 
-    // don't let the transaction get too big
-    if (++num >= cct->_conf->osd_target_transaction_size) {
-      store->apply_transaction(service.meta_osr.get(), std::move(t));
-      t = ObjectStore::Transaction();
-      num = 0;
+      // don't let the transaction get too big
+      if (++num >= cct->_conf->osd_target_transaction_size) {
+        store->apply_transaction(service.meta_osr.get(), std::move(t));
+        t = ObjectStore::Transaction();
+        num = 0;
+      }
     }
+    if (!t.empty())
+      store->apply_transaction(service.meta_osr.get(), std::move(t));
   }
-  if (!t.empty())
-    store->apply_transaction(service.meta_osr.get(), std::move(t));
+
+ fix:
+  // if we have ever fixed any pgs of their same_interval_since field,
+  // write them into disk too.
+  {
+    ObjectStore::Transaction t;
+    int num = 0;
+    for (set<PG*>::iterator i = fixed.begin(); i != fixed.end(); ++i) {
+      PG *pg = *i;
+      pg->lock();
+      pg->dirty_info = true; // update info only
+      pg->write_if_dirty(t);
+      pg->unlock();
+
+      // don't let the transaction get too big
+      if (++num >= cct->_conf->osd_target_transaction_size) {
+        store->apply_transaction(service.meta_osr.get(), std::move(t));
+        t = ObjectStore::Transaction();
+        num = 0;
+      }
+    }
+    if (!t.empty())
+      store->apply_transaction(service.meta_osr.get(), std::move(t));
+  }
 }
 
 /*
