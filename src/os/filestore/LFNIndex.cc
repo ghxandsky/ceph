@@ -74,6 +74,14 @@ struct FDCloser {
 
 /* Public methods */
 
+uint64_t LFNIndex::get_max_escaped_name_len(const hobject_t &obj)
+{
+  ghobject_t ghobj(obj);
+  ghobj.shard_id = shard_id_t(0);
+  ghobj.generation = 0;
+  ghobj.hobj.snap = 0;
+  return lfn_generate_object_name_current(ghobj).size();
+}
 
 int LFNIndex::init()
 {
@@ -521,9 +529,10 @@ int LFNIndex::add_attr_path(const vector<string> &path,
 {
   string full_path = get_full_path_subdir(path);
   maybe_inject_failure();
-  return chain_setxattr(full_path.c_str(), mangle_attr_name(attr_name).c_str(),
-		     reinterpret_cast<void *>(attr_value.c_str()),
-		     attr_value.length());
+  return chain_setxattr<false, true>(
+    full_path.c_str(), mangle_attr_name(attr_name).c_str(),
+    reinterpret_cast<void *>(attr_value.c_str()),
+    attr_value.length());
 }
 
 int LFNIndex::get_attr_path(const vector<string> &path,
@@ -621,13 +630,8 @@ static void append_escaped(string::const_iterator begin,
   }
 }
 
-string LFNIndex::lfn_generate_object_name(const ghobject_t &oid)
+string LFNIndex::lfn_generate_object_name_current(const ghobject_t &oid)
 {
-  if (index_version == HASH_INDEX_TAG)
-    return lfn_generate_object_name_keyless(oid);
-  if (index_version == HASH_INDEX_TAG_2)
-    return lfn_generate_object_name_poolless(oid);
-
   string full_name;
   string::const_iterator i = oid.hobj.oid.name.begin();
   if (oid.hobj.oid.name.substr(0, 4) == "DIR_") {
@@ -850,14 +854,16 @@ int LFNIndex::lfn_created(const vector<string> &path,
 	     << " moving old name to alt attr "
 	     << string(buf, r)
 	     << ", new name is " << full_name << dendl;
-    r = chain_setxattr(full_path.c_str(), get_alt_lfn_attr().c_str(),
-		       buf, r);
+    r = chain_setxattr<false, true>(
+      full_path.c_str(), get_alt_lfn_attr().c_str(),
+      buf, r);
     if (r < 0)
       return r;
   }
 
-  return chain_setxattr(full_path.c_str(), get_lfn_attr().c_str(),
-		     full_name.c_str(), full_name.size());
+  return chain_setxattr<false, true>(
+    full_path.c_str(), get_lfn_attr().c_str(),
+    full_name.c_str(), full_name.size());
 }
 
 int LFNIndex::lfn_unlink(const vector<string> &path,

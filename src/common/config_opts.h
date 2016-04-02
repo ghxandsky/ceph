@@ -1026,6 +1026,12 @@ OPTION(filestore_max_inline_xattrs_xfs, OPT_U32, 10)
 OPTION(filestore_max_inline_xattrs_btrfs, OPT_U32, 10)
 OPTION(filestore_max_inline_xattrs_other, OPT_U32, 2)
 
+// max xattr value size
+OPTION(filestore_max_xattr_value_size, OPT_U32, 0)	//Override
+OPTION(filestore_max_xattr_value_size_xfs, OPT_U32, 64<<10)
+OPTION(filestore_max_xattr_value_size_btrfs, OPT_U32, 64<<10)
+OPTION(filestore_max_xattr_value_size_other, OPT_U32, 2<<10)
+
 OPTION(filestore_sloppy_crc, OPT_BOOL, false)         // track sloppy crcs
 OPTION(filestore_sloppy_crc_block_size, OPT_INT, 65536)
 
