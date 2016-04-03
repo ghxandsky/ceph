@@ -227,14 +227,14 @@ OSDService::OSDService(OSD *osd) :
   peer_map_epoch_lock("OSDService::peer_map_epoch_lock"),
   sched_scrub_lock("OSDService::sched_scrub_lock"), scrubs_pending(0),
   scrubs_active(0),
-  agent_lock("OSD::agent_lock"),
+  agent_lock("OSDService::agent_lock"),
   agent_valid_iterator(false),
   agent_ops(0),
   flush_mode_high_count(0),
   agent_active(true),
   agent_thread(this),
   agent_stop_flag(false),
-  agent_timer_lock("OSD::agent_timer_lock"),
+  agent_timer_lock("OSDService::agent_timer_lock"),
   agent_timer(osd->client_messenger->cct, agent_timer_lock),
   promote_probability_millis(1000),
   last_recalibrate(ceph_clock_now(NULL)),
@@ -242,10 +242,10 @@ OSDService::OSDService(OSD *osd) :
   promote_max_bytes(0),
   objecter(new Objecter(osd->client_messenger->cct, osd->objecter_messenger, osd->monc, NULL, 0, 0)),
   objecter_finisher(osd->client_messenger->cct),
-  watch_lock("OSD::watch_lock"),
+  watch_lock("OSDService::watch_lock"),
   watch_timer(osd->client_messenger->cct, watch_lock),
   next_notif_id(0),
-  backfill_request_lock("OSD::backfill_request_lock"),
+  backfill_request_lock("OSDService::backfill_request_lock"),
   backfill_request_timer(cct, backfill_request_lock, false),
   last_tid(0),
   reserver_finisher(cct),
@@ -254,12 +254,12 @@ OSDService::OSDService(OSD *osd) :
   remote_reserver(&reserver_finisher, cct->_conf->osd_max_backfills,
 		  cct->_conf->osd_min_recovery_priority),
   pg_temp_lock("OSDService::pg_temp_lock"),
-  map_cache_lock("OSDService::map_lock"),
+  map_cache_lock("OSDService::map_cache_lock"),
   map_cache(cct, cct->_conf->osd_map_cache_size),
   map_bl_cache(cct->_conf->osd_map_cache_size),
   map_bl_inc_cache(cct->_conf->osd_map_cache_size),
   in_progress_split_lock("OSDService::in_progress_split_lock"),
-  stat_lock("OSD::stat_lock"),
+  stat_lock("OSDService::stat_lock"),
   full_status_lock("OSDService::full_status_lock"),
   cur_state(NONE),
   last_msg(0),
@@ -2440,9 +2440,6 @@ void OSD::create_logger()
   osd_plb.add_u64_counter(l_osd_push,      "push", "Push messages sent");       // push messages
   osd_plb.add_u64_counter(l_osd_push_outb, "push_out_bytes", "Pushed size");  // pushed bytes
 
-  osd_plb.add_u64_counter(l_osd_push_in,    "push_in", "Inbound push messages");        // inbound push messages
-  osd_plb.add_u64_counter(l_osd_push_inb,   "push_in_bytes", "Inbound pushed size");  // inbound pushed bytes
-
   osd_plb.add_u64_counter(l_osd_rop, "recovery_ops",
       "Started recovery operations", "recop");       // recovery ops (started)
 
@@ -3251,6 +3248,8 @@ struct pistate {
 void OSD::build_past_intervals_parallel()
 {
   map<PG*,pistate> pis;
+  set<PG*> fixed;
+  OSDMapRef cur_map, last_map;
 
   // calculate junction of map range
   epoch_t end_epoch = superblock.oldest_map;
@@ -3264,8 +3263,10 @@ void OSD::build_past_intervals_parallel()
 
       epoch_t start, end;
       if (!pg->_calc_past_interval_range(&start, &end, superblock.oldest_map)) {
-        if (pg->info.history.same_interval_since == 0)
+        if (pg->info.history.same_interval_since == 0) {
           pg->info.history.same_interval_since = end;
+          fixed.insert(pg);
+        }
         continue;
       }
 
@@ -3282,14 +3283,17 @@ void OSD::build_past_intervals_parallel()
     }
   }
   if (pis.empty()) {
-    dout(10) << __func__ << " nothing to build" << dendl;
-    return;
+    if (fixed.empty()) {
+      dout(10) << __func__ << " nothing to build or fix" << dendl;
+      return;
+    }
+
+    goto fix;
   }
 
   dout(1) << __func__ << " over " << cur_epoch << "-" << end_epoch << dendl;
   assert(cur_epoch <= end_epoch);
 
-  OSDMapRef cur_map, last_map;
   for ( ; cur_epoch <= end_epoch; cur_epoch++) {
     dout(10) << __func__ << " epoch " << cur_epoch << dendl;
     last_map = cur_map;
@@ -3373,25 +3377,51 @@ void OSD::build_past_intervals_parallel()
   // but we don't check for holes.  we could avoid it by discarding
   // the previous past_intervals and rebuilding from scratch, or we
   // can just do this and commit all our work at the end.
-  ObjectStore::Transaction t;
-  int num = 0;
-  for (map<PG*,pistate>::iterator i = pis.begin(); i != pis.end(); ++i) {
-    PG *pg = i->first;
-    pg->lock();
-    pg->dirty_big_info = true;
-    pg->dirty_info = true;
-    pg->write_if_dirty(t);
-    pg->unlock();
+  {
+    ObjectStore::Transaction t;
+    int num = 0;
+    for (map<PG*,pistate>::iterator i = pis.begin(); i != pis.end(); ++i) {
+      PG *pg = i->first;
+      pg->lock();
+      pg->dirty_big_info = true;
+      pg->dirty_info = true;
+      pg->write_if_dirty(t);
+      pg->unlock();
 
-    // don't let the transaction get too big
-    if (++num >= cct->_conf->osd_target_transaction_size) {
-      store->apply_transaction(service.meta_osr.get(), std::move(t));
-      t = ObjectStore::Transaction();
-      num = 0;
+      // don't let the transaction get too big
+      if (++num >= cct->_conf->osd_target_transaction_size) {
+        store->apply_transaction(service.meta_osr.get(), std::move(t));
+        t = ObjectStore::Transaction();
+        num = 0;
+      }
     }
+    if (!t.empty())
+      store->apply_transaction(service.meta_osr.get(), std::move(t));
   }
-  if (!t.empty())
-    store->apply_transaction(service.meta_osr.get(), std::move(t));
+
+ fix:
+  // if we have ever fixed any pgs of their same_interval_since field,
+  // write them into disk too.
+  {
+    ObjectStore::Transaction t;
+    int num = 0;
+    for (set<PG*>::iterator i = fixed.begin(); i != fixed.end(); ++i) {
+      PG *pg = *i;
+      pg->lock();
+      pg->dirty_info = true; // update info only
+      pg->write_if_dirty(t);
+      pg->unlock();
+
+      // don't let the transaction get too big
+      if (++num >= cct->_conf->osd_target_transaction_size) {
+        store->apply_transaction(service.meta_osr.get(), std::move(t));
+        t = ObjectStore::Transaction();
+        num = 0;
+      }
+    }
+    if (!t.empty())
+      store->apply_transaction(service.meta_osr.get(), std::move(t));
+  }
 }
 
 /*
@@ -4182,15 +4212,11 @@ void OSD::tick()
   logger->set(l_osd_cached_crc_adjusted, buffer::get_cached_crc_adjusted());
 
   if (is_active() || is_waiting_for_healthy()) {
-    map_lock.get_read();
-
     maybe_update_heartbeat_peers();
 
     heartbeat_lock.Lock();
     heartbeat_check();
     heartbeat_lock.Unlock();
-
-    map_lock.put_read();
   }
 
   if (is_waiting_for_healthy()) {
